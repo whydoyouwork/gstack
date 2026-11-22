@@ -9,11 +9,11 @@
 | **PR** | {PR_NUMBER} ({PR_URL}) or "—" |
 | **Tier** | Quick / Standard / Exhaustive |
 | **Scope** | {SCOPE or "Full app"} |
-| **Duration** | {DURATION} |
+| **Probe budget / guarded command time** | {CONFIGURED LIMIT / SUM OF MEASURED COMMAND SPANS} |
 | **Pages visited** | {COUNT} |
 | **Screenshots** | {COUNT} |
 | **Framework** | {DETECTED or "Unknown"} |
-| **Index** | [All QA runs](./index.md) |
+| **Phones** | {Chromium device profiles emulated, or "—"}; real device still needed (/ios-qa): {what, or "—"} |
 
 ## Health Score: {SCORE}/100
 
@@ -64,11 +64,53 @@
 **Repro Steps:**
 
 1. Navigate to {URL}
-   ![Step 1](screenshots/issue-001-step-1.png)
+   ![Step 1](screenshots/issue-001-step-1.jpg)
 2. {Action}
-   ![Step 2](screenshots/issue-001-step-2.png)
 3. **Observe:** {what goes wrong}
-   ![Result](screenshots/issue-001-result.png)
+   ![Result](screenshots/issue-001-result.jpg)
+
+---
+
+## Fixes Applied (if applicable)
+
+| Issue | Fix Status | Commit | Files Changed |
+|-------|-----------|--------|---------------|
+| ISSUE-NNN | verified / best-effort / reverted / deferred | {SHA} | {files} |
+
+### Before/After Evidence
+
+#### ISSUE-NNN: {title}
+**Before:** ![Before](screenshots/issue-NNN-result.jpg) — the Phase 5 evidence (`issue-NNN.png` for a static bug)
+**After:** ![After](screenshots/issue-NNN-after.jpg)
+
+---
+
+## Regression Tests
+
+| Issue | Test File | Status | Description |
+|-------|-----------|--------|-------------|
+| ISSUE-NNN | path/to/test | committed / deferred / skipped | description |
+
+### Deferred Tests
+
+#### ISSUE-NNN: {title}
+**Precondition:** {setup state that triggers the bug}
+**Action:** {what the user does}
+**Expected:** {correct behavior}
+**Why deferred:** {reason}
+
+---
+
+## Ship Readiness
+
+| Metric | Value |
+|--------|-------|
+| Health score | {before} → {after} ({delta}) |
+| Issues found | N |
+| Fixes applied | N (verified: X, best-effort: Y, reverted: Z) |
+| Deferred | N |
+
+**PR Summary:** "QA found N issues, fixed M, health score X → Y."
 
 ---
 

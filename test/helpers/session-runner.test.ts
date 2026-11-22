@@ -1,5 +1,60 @@
 import { describe, test, expect } from 'bun:test';
-import { parseNDJSON } from './session-runner';
+import { spawnSync } from 'node:child_process';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { browseNavigatedTo, parseNDJSON } from './session-runner';
+import captured_scrape_goto from '../fixtures/scrape-prototype-goto-42571575838.json';
+
+test('runSkillTest launches a child without operator credentials', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-hermetic-session-'));
+  try {
+    const bin = path.join(root, 'claude');
+    fs.writeFileSync(bin, `#!/usr/bin/env node
+const names = ['GITHUB_TOKEN', 'GITHUB_PERSONAL_ACCESS_TOKEN', 'GITHUB_APP_PRIVATE_KEY', 'GH_TOKEN', 'GITHUB_ACTIONS', 'GITHUB_PATH', 'GITHUB_TOKENIZER', 'EVALS_RUN_ID'];
+const present = Object.fromEntries(names.map(name => [name, Object.hasOwn(process.env, name)]));
+console.log(JSON.stringify({type: 'result', subtype: 'success', result: JSON.stringify(present)}));
+`, { mode: 0o700 });
+    const script = `import { runSkillTest } from ${JSON.stringify(pathToFileURL(path.join(import.meta.dir, 'session-runner.ts')).href)};
+const result = await runSkillTest({prompt: 'synthetic fixture', workingDirectory: ${JSON.stringify(root)}, model: 'fixture', timeout: 5000, startupGraceMs: 5000, allowedTools: []});
+console.log(JSON.stringify({exitReason: result.exitReason, child: JSON.parse(result.output)}));`;
+    const result = spawnSync(process.execPath, ['-e', script], {
+      cwd: path.resolve(import.meta.dir, '..', '..'),
+      encoding: 'utf8',
+      timeout: 30_000,
+      env: {
+        PATH: `${root}${path.delimiter}${process.env.PATH ?? '/usr/bin:/bin'}`,
+        HOME: root,
+        TMPDIR: os.tmpdir(),
+        GITHUB_TOKEN: 'synthetic-token',
+        GITHUB_PERSONAL_ACCESS_TOKEN: 'synthetic-pat',
+        GITHUB_APP_PRIVATE_KEY: 'synthetic-private-key',
+        GH_TOKEN: 'synthetic-gh-token',
+        GITHUB_ACTIONS: 'true',
+        GITHUB_PATH: '/tmp/actions-path',
+        GITHUB_TOKENIZER: 'metadata-tokenizer',
+        EVALS_RUN_ID: 'synthetic-run',
+      },
+    });
+    expect(result.status, result.stderr).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual({
+      exitReason: 'success',
+      child: {
+        GITHUB_TOKEN: false,
+        GITHUB_PERSONAL_ACCESS_TOKEN: false,
+        GITHUB_APP_PRIVATE_KEY: false,
+        GH_TOKEN: false,
+        GITHUB_ACTIONS: true,
+        GITHUB_PATH: true,
+        GITHUB_TOKENIZER: true,
+        EVALS_RUN_ID: true,
+      },
+    });
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
 
 // Fixture: minimal NDJSON session (system init, assistant with tool_use, tool result, assistant text, result)
 const FIXTURE_LINES = [
@@ -92,5 +147,173 @@ describe('parseNDJSON', () => {
     const parsed = parseNDJSON(lines);
     expect(parsed.turnCount).toBe(2);
     expect(parsed.toolCalls).toHaveLength(0);
+  });
+
+  test('associates Agent verdict text with its tool-use ID without transport metadata or reasoning', () => {
+    const lines = [
+      { type: 'assistant', message: { content: [
+        { type: 'tool_use', id: 'review', name: 'Agent', input: { prompt: 'Review the design.' } },
+      ] } },
+      { type: 'user', tool_use_result: { content: [
+        { type: 'thinking', thinking: 'Private computation must not become tool output.' },
+        { type: 'text', text: 'Completeness: missing failure handling.' },
+        { type: 'text', text: 'Quality score: 7/10' },
+      ] }, message: { content: [
+        { type: 'tool_result', tool_use_id: 'review', content: [
+          { type: 'text', text: 'Completeness: missing failure handling.\nQuality score: 7/10' },
+          { type: 'text', text: 'agentId: child-review\n<usage>duration_ms: 1000</usage>' },
+        ] },
+      ] } },
+    ].map(event => JSON.stringify(event));
+
+    expect(parseNDJSON(lines).toolCalls).toEqual([{
+      tool: 'Agent',
+      input: { prompt: 'Review the design.' },
+      output: 'Completeness: missing failure handling.\nQuality score: 7/10',
+    }]);
+  });
+
+  test('preserves Task error-result diagnostics as output', () => {
+    const lines = [
+      { type: 'assistant', message: { content: [
+        { type: 'tool_use', id: 'failed-review', name: 'Task', input: {} },
+      ] } },
+      { type: 'user', message: { content: [
+        { type: 'tool_result', tool_use_id: 'failed-review', is_error: true, content: 'Reviewer failed: deadline exceeded.' },
+      ] } },
+    ].map(event => JSON.stringify(event));
+
+    expect(parseNDJSON(lines).toolCalls[0].output).toBe('Reviewer failed: deadline exceeded.');
+  });
+
+  test('flattens only public text blocks from matching message results', () => {
+    const lines = [
+      { type: 'assistant', message: { content: [
+        { type: 'tool_use', id: 'legacy-task', name: 'Task', input: {} },
+        { type: 'tool_use', id: 'shell', name: 'Bash', input: { command: 'echo done' } },
+      ] } },
+      { type: 'user', message: { content: [
+        { type: 'tool_result', tool_use_id: 'legacy-task', content: [
+          { type: 'text', text: 'Consistency: PASS' },
+          { type: 'image', source: { data: 'not-text' } },
+          { type: 'thinking', thinking: 'Private computation.' },
+          { type: 'redacted_thinking', data: 'opaque' },
+          null,
+          { type: 'text', text: 123 },
+          { type: 'text', text: 'Quality score: 10/10' },
+        ] },
+        { type: 'tool_result', tool_use_id: 'shell', content: 'done\n' },
+      ] } },
+    ].map(event => JSON.stringify(event));
+
+    const parsed = parseNDJSON(lines);
+    expect(parsed.toolCalls.map(call => call.output)).toEqual([
+      'Consistency: PASS\nQuality score: 10/10', 'done\n',
+    ]);
+    expect(parsed.toolCallCount).toBe(2);
+    expect(parsed.turnCount).toBe(1);
+  });
+
+  test('leaves missing, unmatched, and malformed results empty', () => {
+    const lines = [
+      { type: 'assistant', message: { content: [
+        { type: 'tool_use', id: 'missing', name: 'Agent', input: {} },
+        { type: 'tool_use', id: 'malformed', name: 'Task', input: {} },
+        { type: 'tool_use', name: 'Read', input: {} },
+      ] } },
+      { type: 'user', message: { content: [
+        { type: 'tool_result', tool_use_id: 'unknown', content: 'Do not attach to the latest call.' },
+        { type: 'tool_result', tool_use_id: 'malformed', content: { text: 'Not a public content block.' } },
+        { type: 'tool_result', content: 'No tool-use ID.' },
+      ] } },
+      { type: 'user', message: { content: 'Not a tool-result array.' } },
+    ].map(event => JSON.stringify(event));
+
+    expect(parseNDJSON(lines).toolCalls.map(call => call.output)).toEqual(['', '', '']);
+  });
+
+  test('scopes repeated tool-use IDs to the parent so child results cannot replace the parent verdict', () => {
+    const lines = [
+      { type: 'assistant', parent_tool_use_id: null, message: { content: [
+        { type: 'tool_use', id: 'shared', name: 'Agent', input: { prompt: 'Parent review' } },
+      ] } },
+      { type: 'assistant', parent_tool_use_id: 'shared', message: { content: [
+        { type: 'tool_use', id: 'shared', name: 'Read', input: { file_path: '/tmp/design.md' } },
+      ] } },
+      { type: 'user', parent_tool_use_id: 'shared', message: { content: [
+        { type: 'tool_result', tool_use_id: 'shared', content: 'Child file content' },
+      ] } },
+      { type: 'user', message: { content: [
+        { type: 'tool_result', tool_use_id: 'shared', content: 'Parent review verdict' },
+      ] } },
+      { type: 'user', parent_tool_use_id: 'another-child', message: { content: [
+        { type: 'tool_result', tool_use_id: 'shared', content: 'Unrelated child result' },
+      ] } },
+    ].map(event => JSON.stringify(event));
+
+    const parsed = parseNDJSON(lines);
+    expect(parsed.toolCalls.map(call => call.output)).toEqual(['Parent review verdict', 'Child file content']);
+    expect(parsed.toolCallCount).toBe(2);
+    expect(parsed.turnCount).toBe(2);
+  });
+});
+
+describe('browseNavigatedTo', () => {
+  const trials = captured_scrape_goto.trials.map(trial => ({
+    url: `file://${trial.cwd}/fixture.html`,
+    calls: parseNDJSON(trial.events.map(event => JSON.stringify(event))).toolCalls,
+  }));
+  const bash = (command: string, output: string) => [{ tool: 'Bash', input: { command }, output }];
+
+  test('credits every captured scrape-prototype-path goto file://$PWD/fixture.html (run 42571575838)', () => {
+    expect(trials).toHaveLength(3);
+    for (const { url, calls } of trials) {
+      expect(calls.some(call => String(call.input.command).includes(url))).toBe(false);
+      expect(browseNavigatedTo(calls, url)).toBe(true);
+    }
+  });
+
+  test('a different file, an echoed URL, another path or a failed navigation is not credited', () => {
+    const { url, calls } = trials[0]!;
+    expect(browseNavigatedTo(calls, url.replace('fixture.html', 'other.html'))).toBe(false);
+    expect(browseNavigatedTo(bash(`echo "${url}"`, url), url)).toBe(false);
+    expect(browseNavigatedTo(bash(`echo "Navigated to ${url} (200)"`, `Navigated to ${url} (200)`), url)).toBe(false);
+    expect(browseNavigatedTo(bash('$B goto file:///tmp/elsewhere/fixture.html', 'Navigated to file:///tmp/elsewhere/fixture.html (200)'), url)).toBe(false);
+    expect(browseNavigatedTo(bash(`$B goto ${url}`, `Error: page.goto: net::ERR_FILE_NOT_FOUND at ${url}`), url)).toBe(false);
+    expect(browseNavigatedTo(bash(`$B goto ${url}`, `Navigated to ${url} (404)`), url)).toBe(false);
+  });
+
+  test('a goto with its stdout sent to /dev/null is credited only when the call proves it exited 0 (PR #4223 outside-voice#1)', () => {
+    const { url } = trials[0]!;
+    const cwd = url.replace(/^file:\/\//, '').replace(/\/fixture\.html$/, '');
+    const html = '<html><body><ul><li>Alpha 12</li></ul></body></html>';
+    const credited = (command: string, output = html) => browseNavigatedTo(bash(command, output), url, cwd);
+    for (const command of ['B=/x/browse; $B goto "file://$PWD/fixture.html" >/dev/null && $B html',
+      `$B goto ${url} >/dev/null 2>&1 && $B text`, `"$B" goto '${url}' > /dev/null &&\n  $B html`,
+      '/x/browse/dist/browse goto "file://${PWD}/fixture.html" &>/dev/null && /x/browse/dist/browse html'])
+      expect(credited(command), command).toBe(true);
+    expect(browseNavigatedTo(bash(`cd ${cwd} && $B goto file://$PWD/fixture.html >/dev/null && $B html`, html), url)).toBe(true);
+    expect(browseNavigatedTo([...bash(`cd ${cwd}`, ''), ...bash('$B goto "file://$PWD/fixture.html" >/dev/null && $B html', html)], url))
+      .toBe(true);
+    for (const command of ['$B goto "file://$PWD/fixture.html" >/dev/null; $B html',
+      '$B goto "file://$PWD/fixture.html" >/dev/null || $B html', '$B goto "file://$PWD/fixture.html" >/dev/null & $B html',
+      '$B goto "file://$PWD/fixture.html" >/dev/null && $B html; echo done', '$B goto "file://$PWD/fixture.html" && $B html',
+      "$B goto 'file://$PWD/fixture.html' >/dev/null && $B html", '$B goto "file://$PWD/other.html" >/dev/null && $B html',
+      'cd /tmp/elsewhere && $B goto "file://$PWD/fixture.html" >/dev/null && $B html',
+      'cd "$HOME" && $B goto "file://$PWD/fixture.html" >/dev/null && $B html',
+      `echo "$B goto ${url}" >/dev/null && $B html`, `$B text goto ${url} >/dev/null && $B html`,
+      '$B status >/dev/null || $B goto "file://$PWD/fixture.html" >/dev/null && $B html',
+      `cd ${cwd} && $B status || $B goto "file://$PWD/fixture.html" >/dev/null && $B html`,
+      'true || echo | $B goto "file://$PWD/fixture.html" >/dev/null && $B html'])
+      expect(credited(command), command).toBe(false);
+    for (const command of [`test -d ${cwd} || exit 1; $B goto "file://$PWD/fixture.html" >/dev/null && $B html`,
+      '[ -x "$B" ] || B=/x/browse && $B goto "file://$PWD/fixture.html" >/dev/null && $B html'])
+      expect(credited(command), command).toBe(true);
+    const http = 'http://127.0.0.1:9/missing';
+    expect(browseNavigatedTo(bash(`$B goto ${http} >/dev/null && $B html`, '<html>Not Found</html>'), http)).toBe(false);
+    const goto = '$B goto "file://$PWD/fixture.html" >/dev/null && $B html';
+    expect(browseNavigatedTo(bash(goto, html), url)).toBe(false);
+    for (const output of [`Exit code 1\n${html}`, `Error: page.goto: net::ERR_FILE_NOT_FOUND at ${url}`, '<tool_use_error>denied</tool_use_error>'])
+      expect(credited(goto, output), output).toBe(false);
   });
 });
